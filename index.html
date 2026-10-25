@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Онлайн Radmir 21</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root { --bg:#0f1218; --card:#181d27; --line:#262d3b; --text:#e8ecf3; --mute:#8a94a8; --acc:#4da3ff; --ok:#3ddc84; --bad:#ff5d5d; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  .wrap { max-width:1000px; margin:0 auto; padding:16px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--mute); font-size:13px; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--mute); display:inline-block; }
+  .dot.ok { background:var(--ok); box-shadow:0 0 8px var(--ok); animation:p 2s infinite; }
+  .dot.bad { background:var(--bad); }
+  @keyframes p { 50% { opacity:.4; } }
+  .big { margin:14px 0; display:flex; align-items:baseline; gap:10px; }
+  .big b { font-size:56px; line-height:1; }
+  .big span { color:var(--mute); font-size:18px; }
+  .tabs { display:flex; flex-wrap:wrap; gap:6px; margin:10px 0 12px; }
+  .tabs button { background:var(--card); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:7px 12px; cursor:pointer; font-size:14px; }
+  .tabs button.on { background:var(--acc); border-color:var(--acc); color:#06121f; font-weight:600; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px; }
+  .chart { height:380px; position:relative; }
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin-top:12px; }
+  .stats .card small { color:var(--mute); display:block; font-size:12px; }
+  .stats .card div { font-size:20px; font-weight:600; margin-top:2px; }
+  .err { color:var(--bad); margin-top:10px; font-size:13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Radmir CRMP — сервер 21</h1>
+  <div class="sub"><span class="dot" id="dot"></span><span id="status">загрузка…</span></div>
+  <div class="big"><b id="now">–</b><span id="max"></span></div>
+  <div class="tabs" id="tabs"></div>
+  <div class="card chart"><canvas id="c"></canvas></div>
+  <div class="stats">
+    <div class="card"><small>Максимум за период</small><div id="s-max">–</div></div>
+    <div class="card"><small>Когда был пик</small><div id="s-peak">–</div></div>
+    <div class="card"><small>Минимум</small><div id="s-min">–</div></div>
+    <div class="card"><small>Среднее</small><div id="s-avg">–</div></div>
+    <div class="card"><small>Замеров</small><div id="s-n">–</div></div>
+  </div>
+  <div class="err" id="err"></div>
+</div>
+
+<script>
+// [название, секунд (0 = всё время), как часто обновлять график, сек]
+const RANGES = [["Live · 10 мин",600,5],["1 час",3600,10],["24 часа",86400,30],["7 дней",604800,60],["30 дней",2592000,120],["365 дней",31536000,300],["Всё время",0,300]];
+let cur = RANGES[0], chart = null, histTimer = null;
+
+const pad = n => String(n).padStart(2, "0");
+const fmtTime = ms => { const d = new Date(ms); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+const fmtTimeS = ms => fmtTime(ms) + ":" + pad(new Date(ms).getSeconds());
+const fmtDate = ms => { const d = new Date(ms); return `${pad(d.getDate())}.${pad(d.getMonth()+1)}`; };
+const fmtFull = ms => `${fmtDate(ms)}.${new Date(ms).getFullYear()} ${fmtTime(ms)}`;
+
+async function refreshNow() {
+  try {
+    const r = await (await fetch("/api/now")).json();
+    const dot = document.getElementById("dot");
+    if (r.online !== null) {
+      document.getElementById("now").textContent = r.online;
+      document.getElementById("max").textContent = r.max ? "из " + r.max : "";
+      const age = r.t - r.sample_t;
+      const fresh = age < 30;
+      dot.className = "dot " + (fresh ? "ok" : "bad");
+      document.getElementById("status").textContent = fresh ? "онлайн в реальном времени · замер " + fmtTimeS(r.sample_t * 1000)
+        : "сервер не отвечает уже " + Math.round(age / 60) + " мин" + (r.last_err ? " (" + r.last_err + ")" : "");
+    } else {
+      dot.className = "dot bad";
+      document.getElementById("status").textContent = r.last_err ? "нет ответа от сервера: " + r.last_err : "ждём первый замер…";
+    }
+  } catch (e) {
+    document.getElementById("status").textContent = "связь со страницей потеряна, пробую снова…";
+  }
+}
+
+async function refreshHistory() {
+  const [, sec] = cur;
+  try {
+    const d = await (await fetch("/api/history?sec=" + sec)).json();
+    document.getElementById("err").textContent = "";
+    draw(d, sec);
+  } catch (e) {
+    document.getElementById("err").textContent = "Не удалось загрузить график: " + e.message;
+  }
+}
+
+function draw(d, sec) {
+  const pts = d.points.map(p => ({ x: p[0] * 1000, y: p[1] }));
+  const from = d.from * 1000, to = d.to * 1000, spanH = (to - from) / 3600e3;
+  const tick = v => spanH <= 1 ? fmtTimeS(v) : spanH <= 36 ? fmtTime(v) : spanH <= 24 * 8 ? fmtDate(v) + " " + fmtTime(v) : fmtDate(v);
+  const s = d.stats;
+  document.getElementById("s-max").textContent = s ? s.max : "–";
+  document.getElementById("s-peak").textContent = s ? fmtFull(s.max_t * 1000) : "–";
+  document.getElementById("s-min").textContent = s ? s.min : "–";
+  document.getElementById("s-avg").textContent = s ? s.avg : "–";
+  document.getElementById("s-n").textContent = s ? s.n : "–";
+
+  if (chart) {
+    chart.data.datasets[0].data = pts;
+    chart.options.scales.x.min = from; chart.options.scales.x.max = to;
+    chart.options.scales.x.ticks.callback = tick;
+    chart.update("none");
+    return;
+  }
+  chart = new Chart(document.getElementById("c"), {
+    type: "line",
+    data: { datasets: [{ data: pts, borderColor: "#4da3ff", backgroundColor: "rgba(77,163,255,.15)", fill: true, pointRadius: 0, borderWidth: 2, tension: .25, spanGaps: false }] },
+    options: {
+      parsing: false, animation: false, maintainAspectRatio: false,
+      interaction: { mode: "nearest", axis: "x", intersect: false },
+      plugins: { legend: { display: false }, tooltip: { callbacks: { title: it => fmtFull(it[0].parsed.x) + ":" + pad(new Date(it[0].parsed.x).getSeconds()), label: it => "Онлайн: " + it.parsed.y } } },
+      scales: {
+        x: { type: "linear", min: from, max: to, ticks: { color: "#8a94a8", maxTicksLimit: 8, callback: tick }, grid: { color: "#262d3b" } },
+        y: { grace: "10%", ticks: { color: "#8a94a8" }, grid: { color: "#262d3b" } }
+      }
+    }
+  });
+}
+
+function select(r, btn) {
+  cur = r;
+  [...document.getElementById("tabs").children].forEach(x => x.className = "");
+  btn.className = "on";
+  if (chart) { chart.destroy(); chart = null; }
+  clearInterval(histTimer);
+  refreshHistory();
+  histTimer = setInterval(refreshHistory, r[2] * 1000);
+}
+
+const tabs = document.getElementById("tabs");
+RANGES.forEach(r => {
+  const b = document.createElement("button");
+  b.textContent = r[0];
+  b.onclick = () => select(r, b);
+  tabs.appendChild(b);
+});
+select(RANGES[0], tabs.children[0]);
+refreshNow();
+setInterval(refreshNow, 5000);
+</script>
+</body>
+</html>
