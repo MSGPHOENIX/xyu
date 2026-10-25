@@ -188,6 +188,26 @@ def now_info():
                 "max": state["last_max"], "last_err": state["last_err"]}
 
 
+def udp_test():
+    """Проверка: пропускает ли хостинг исходящий UDP вообще (запрос к публичным DNS)."""
+    query = (b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+             b"\x07example\x03com\x00\x00\x01\x00\x01")
+    result = {}
+    for ip in ("8.8.8.8", "1.1.1.1"):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.settimeout(3)
+                s.sendto(query, (ip, 53))
+                data, _ = s.recvfrom(512)
+            result[ip] = f"ответ получен ({len(data)} байт)"
+        except Exception as e:
+            result[ip] = "нет ответа: " + (str(e) or e.__class__.__name__)
+    result["вывод"] = ("UDP наружу работает — значит, игровой сервер не отвечает хостингу"
+                       if any(v.startswith("ответ") for v in result.values())
+                       else "UDP наружу, похоже, заблокирован на хостинге")
+    return result
+
+
 def status_info():
     with lock:
         return dict(state, minutes_in_memory=len(m_ts), pending=len(pending), server=SERVER,
@@ -226,6 +246,8 @@ class Handler(BaseHTTPRequestHandler):
             data = build(sec)
         elif u.path == "/api/status":
             data = status_info()
+        elif u.path == "/api/udptest":
+            data = udp_test()
         else:
             return self._send(404, b"not found", "text/plain", head)
         self._send(200, json.dumps(data).encode(), "application/json", head)
