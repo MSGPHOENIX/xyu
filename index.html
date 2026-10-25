@@ -49,7 +49,7 @@
 
 <script>
 // [название, секунд (0 = всё время), как часто обновлять график, сек]
-const RANGES = [["Live · 10 мин",600,5],["1 час",3600,10],["24 часа",86400,30],["7 дней",604800,60],["30 дней",2592000,120],["365 дней",31536000,300],["Всё время",0,300]];
+const RANGES = [["Live · 30 мин",1800,15],["1 час",3600,10],["24 часа",86400,30],["7 дней",604800,60],["30 дней",2592000,120],["365 дней",31536000,300],["Всё время",0,300]];
 let cur = RANGES[0], chart = null, histTimer = null;
 
 const pad = n => String(n).padStart(2, "0");
@@ -66,10 +66,11 @@ async function refreshNow() {
       document.getElementById("now").textContent = r.online;
       document.getElementById("max").textContent = r.max ? "из " + r.max : "";
       const age = r.t - r.sample_t;
-      const fresh = age < 30;
+      const fresh = age < r.poll * 3 + 10;
       dot.className = "dot " + (fresh ? "ok" : "bad");
-      document.getElementById("status").textContent = fresh ? "онлайн в реальном времени · замер " + fmtTimeS(r.sample_t * 1000)
-        : "сервер не отвечает уже " + Math.round(age / 60) + " мин" + (r.last_err ? " (" + r.last_err + ")" : "");
+      const src = r.mode === "web" ? " · данные сайта-монитора" + (r.src_updated ? " (обновлено " + r.src_updated + " МСК)" : "") : "";
+      document.getElementById("status").textContent = fresh ? "онлайн сейчас · замер " + fmtTimeS(r.sample_t * 1000) + src
+        : "нет свежих данных уже " + Math.round(age / 60) + " мин" + (r.last_err ? " (" + r.last_err + ")" : "");
     } else {
       dot.className = "dot bad";
       document.getElementById("status").textContent = r.last_err ? "нет ответа от сервера: " + r.last_err : "ждём первый замер…";
