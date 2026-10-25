@@ -4,20 +4,29 @@
 Работает на Render (бесплатный Web Service). Только psycopg2 для базы.
 """
 import bisect
+import gzip
+import html
 import json
 import os
+import re
 import signal
 import socket
 import struct
 import sys
 import threading
 import time
+import urllib.request
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 SERVER = os.environ.get("SERVER_ADDR", "80.66.71.92:7777")
-POLL = float(os.environ.get("POLL_SEC", "5"))
+# MODE=web: брать онлайн со страницы сайта-монитора (работает с хостингов)
+# MODE=udp: спрашивать игровой сервер напрямую (работает только с «домашнего» адреса)
+MODE = os.environ.get("MODE", "web").lower()
+WEB_URL = os.environ.get("WEB_URL", "https://libertycity.ru/servers/radmir-rp/")
+WEB_ROMAN = os.environ.get("WEB_SERVER_NAME", "XXI")  # как сервер подписан на сайте
+POLL = float(os.environ.get("POLL_SEC", "60" if MODE == "web" else "5"))
 FLUSH = int(os.environ.get("FLUSH_MIN", "30")) * 60
 DB_URL = os.environ.get("DATABASE_URL", "")
 PORT = int(os.environ.get("PORT", "10000"))
@@ -41,6 +50,47 @@ def query_info(host, port, timeout=2.0):
         s.sendto(packet, (ip, port))
         data, _ = s.recvfrom(2048)
     return struct.unpack_from("<HH", data, 12)
+
+
+# ---------- онлайн со страницы сайта-монитора ----------
+def _web_text():
+    req = urllib.request.Request(WEB_URL, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept-Language": "ru-RU,ru;q=0.9", "Accept-Encoding": "gzip"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        raw = r.read()
+        if r.headers.get("Content-Encoding") == "gzip":
+            raw = gzip.decompress(raw)
+        charset = r.headers.get_content_charset() or "utf-8"
+    text = raw.decode(charset, errors="replace")
+    text = re.sub(r"<(script|style)\b.*?</\1>", " ", text, flags=re.S | re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", html.unescape(text))
+
+
+def _web_matches(plain):
+    pat = r"(?<![A-Za-zА-Яа-я])" + re.escape(WEB_ROMAN) + r"(?![A-Za-zА-Яа-я])\s*\|?\s*(\d{1,5})(?!\d)"
+    return [int(m.group(1)) for m in re.finditer(pat, plain)]
+
+
+def web_sample():
+    plain = _web_text()
+    vals = [v for v in _web_matches(plain) if v <= 5000]
+    if not vals:
+        raise RuntimeError(f"на странице не найден сервер {WEB_ROMAN}")
+    u = re.search(r"Обновлено\s+(\d{1,2}:\d{2})\s*МСК", plain)
+    state["src_updated"] = u.group(1) if u else ""
+    return vals[0], None
+
+
+def web_debug():
+    try:
+        plain = _web_text()
+    except Exception as e:
+        return {"ошибка": str(e) or e.__class__.__name__}
+    i = plain.find(WEB_ROMAN)
+    return {"найдено_чисел": _web_matches(plain), "длина_текста": len(plain),
+            "фрагмент": plain[max(0, i - 80):i + 160] if i >= 0 else plain[:300]}
 
 
 # ---------- минутные агрегаты ----------
@@ -70,7 +120,7 @@ def collector():
     while True:
         t0 = time.time()
         try:
-            players, maxp = query_info(host, port)
+            players, maxp = web_sample() if MODE == "web" else query_info(host, port)
             ok, err = True, ""
         except Exception as e:
             ok, err, players, maxp = False, str(e) or e.__class__.__name__, -1, -1
@@ -79,7 +129,9 @@ def collector():
             state["samples"] += 1
             live.append((now, players if ok else -1))
             if ok:
-                state["last_ok"], state["last_max"], state["last_err"] = now, maxp, ""
+                state["last_ok"], state["last_err"] = now, ""
+                if maxp is not None:
+                    state["last_max"] = maxp
                 _roll(now, players)
             else:
                 state["fails"] += 1
@@ -185,7 +237,8 @@ def now_info():
     with lock:
         last = next(((tt, v) for tt, v in reversed(live) if v >= 0), None)
         return {"t": t, "online": last[1] if last else None, "sample_t": last[0] if last else None,
-                "max": state["last_max"], "last_err": state["last_err"]}
+                "max": state["last_max"], "last_err": state["last_err"],
+                "poll": POLL, "mode": MODE, "src_updated": state.get("src_updated", "")}
 
 
 def udp_test():
@@ -211,7 +264,7 @@ def udp_test():
 def status_info():
     with lock:
         return dict(state, minutes_in_memory=len(m_ts), pending=len(pending), server=SERVER,
-                    poll_sec=POLL, uptime_sec=int(time.time()) - state["started"])
+                    poll_sec=POLL, mode=MODE, uptime_sec=int(time.time()) - state["started"])
 
 
 # ---------- веб-сервер ----------
@@ -248,6 +301,8 @@ class Handler(BaseHTTPRequestHandler):
             data = status_info()
         elif u.path == "/api/udptest":
             data = udp_test()
+        elif u.path == "/api/source":
+            data = web_debug()
         else:
             return self._send(404, b"not found", "text/plain", head)
         self._send(200, json.dumps(data).encode(), "application/json", head)
@@ -264,7 +319,8 @@ def main():
     signal.signal(signal.SIGTERM, on_term)
     threading.Thread(target=collector, daemon=True).start()
     threading.Thread(target=flusher, daemon=True).start()
-    print(f"Старт: сервер {SERVER}, опрос каждые {POLL} с, порт {PORT}, база: {state['db']}", flush=True)
+    src = WEB_URL if MODE == "web" else SERVER
+    print(f"Старт: режим {MODE}, источник {src}, опрос каждые {POLL} с, порт {PORT}, база: {state['db']}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 
